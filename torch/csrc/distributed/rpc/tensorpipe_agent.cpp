@@ -399,12 +399,19 @@ float TensorPipeAgent::TimeSeriesMetricsTracker::computeAverage() const {
 
 ////////////////////////  TensorpipeRpcAgent  /////////////////////////////////
 
-void TensorPipeAgent::removeFromTimeoutMap(
-    uint64_t messageId,
-    steady_clock_time_point expirationTime) {
+void TensorPipeAgent::removeFromTimeoutMap(uint64_t messageId) {
   // Remove entry from timeoutMap_.
   {
     std::unique_lock<std::mutex> lock(timeoutMapMutex_);
+    auto it = messageIdToTimeout_.find(messageId);
+    if (it == messageIdToTimeout_.end()) {
+      // Already removed from the map by pollTimeoutRpcs(), no need to
+      // process further.
+      return;
+    }
+
+    auto& expirationTime = it->second;
+
     auto& timedOutFuturesVector = timeoutMap_[expirationTime];
     for (auto it = timedOutFuturesVector.begin();
          it != timedOutFuturesVector.end();
@@ -418,6 +425,9 @@ void TensorPipeAgent::removeFromTimeoutMap(
     if (timedOutFuturesVector.empty()) {
       timeoutMap_.erase(expirationTime);
     }
+
+    // Remove from messageId to timeout map as well.
+    messageIdToTimeout_.erase(messageId);
   }
 }
 
@@ -916,6 +926,7 @@ std::shared_ptr<JitFuture> TensorPipeAgent::send(
     {
       std::unique_lock<std::mutex> lock(timeoutMapMutex_);
       auto& timeoutFuturesVector = timeoutMap_[expirationTime];
+      messageIdToTimeout_.emplace(std::make_pair(messageId, expirationTime));
       timeoutFuturesVector.emplace_back(
           messageId, futureResponseMessage, timeout);
     }
@@ -932,8 +943,7 @@ std::shared_ptr<JitFuture> TensorPipeAgent::send(
       std::move(requestMessage),
       std::move(devices),
       std::move(ctx),
-      [this, &clientPipe, messageId, expirationTime](
-          const tensorpipe::Error& error) mutable {
+      [this, &clientPipe, messageId](const tensorpipe::Error& error) mutable {
         if (error) {
           if (error.isOfType<tensorpipe::PipeClosedError>() &&
               !rpcAgentRunning_.load()) {
@@ -958,7 +968,7 @@ std::shared_ptr<JitFuture> TensorPipeAgent::send(
 
         pipeRead(
             clientPipe.pipe_,
-            [this, &clientPipe, expirationTime](
+            [this, &clientPipe](
                 const tensorpipe::Error& error,
                 Message&& responseMessage,
                 std::shared_ptr<LazyStreamContext> ctx) {
@@ -985,10 +995,11 @@ std::shared_ptr<JitFuture> TensorPipeAgent::send(
                 std::string errorMsg = error.what();
                 for (auto& p : pendingMsgs) {
                   markFutureWithError(std::move(p.second), errorMsg);
+
+                  // Remove entry from timeoutMap_.
+                  removeFromTimeoutMap(p.first);
                 }
 
-                // Remove entry from timeoutMap_.
-                removeFromTimeoutMap(responseMessage.id(), expirationTime);
                 return;
               }
 
@@ -1017,7 +1028,7 @@ std::shared_ptr<JitFuture> TensorPipeAgent::send(
               }
 
               // Remove entry from timeoutMap_.
-              removeFromTimeoutMap(messageId, expirationTime);
+              removeFromTimeoutMap(messageId);
 
               if (responseMessage.type() == MessageType::EXCEPTION) {
                 markFutureWithError(
@@ -1065,10 +1076,15 @@ void TensorPipeAgent::pollTimeoutRpcs() {
     // outside the lock.
     std::vector<TimeoutMessageMetadata> timedOutFutures =
         std::move(timeoutMap_.begin()->second);
+
     // We can safely remove this key from the timeoutMap_ since all these
     // futures will be processed.
     timeoutMap_.erase(timeoutMap_.begin());
 
+    for (auto& timeoutMetadata : timedOutFutures) {
+      // Remove from messageIdToTimeout map.
+      messageIdToTimeout_.erase(timeoutMetadata.messageId);
+    }
     lock.unlock();
 
     // Set an error on futures added to the timedOutFutures vector. We do this
@@ -1373,6 +1389,10 @@ size_t TensorPipeAgent::numPendingResponses() {
     totalPending += entry.second.pendingResponseMessage_.size();
   }
   return totalPending;
+}
+size_t TensorPipeAgent::messageIdToTimeoutMapSize() {
+  std::unique_lock<std::mutex> lock(timeoutMapMutex_);
+  return messageIdToTimeout_.size();
 }
 
 } // namespace rpc
