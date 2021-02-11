@@ -527,7 +527,7 @@ if __name__ == '__main__':
 
 import torch
 from torch.testing._internal.common_utils import (run_tests, slowTest)
-from torch.testing._internal.common_distributed import MultiProcessTestCase
+from torch.testing._internal.common_distributed import MultiProcessTestCase, instantiate_device_type_tests
 
 class TestThatContainsCUDAAssertFailure(MultiProcessTestCase):
 
